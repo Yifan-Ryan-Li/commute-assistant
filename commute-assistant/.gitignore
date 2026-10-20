@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+jobs.json
+profile.json
+source_config.json
+commute_config.json
+jobbot.sqlite3
+daily_report_*.md
+commute_reports/
+.local_secrets/
+commute_logs/

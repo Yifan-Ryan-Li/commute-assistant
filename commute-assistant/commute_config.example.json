@@ -1,0 +1,14 @@
+{
+  "city": "上海",
+  "weather_area": "上海市区级近似位置",
+  "latitude": 31.2304,
+  "longitude": 121.4737,
+  "morning_start": 7,
+  "morning_end": 9,
+  "evening_start": 17,
+  "evening_end": 19,
+  "route_city": "上海市",
+  "origin": "上海市普陀区真北路与古浪路交叉口",
+  "destination": "上海市闵行区上海交通大学闵行校区",
+  "route_strategy": 0
+}
