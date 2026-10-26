@@ -11,3 +11,8 @@ daily_report_*.md
 commute_reports/
 .local_secrets/
 commute_logs/
+commute_history.sqlite3
+commute-local-cert.pem
+commute-local-key.pem
+commute-root-ca.pem
+phone-setup/

@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
+from route_history import record_snapshot
 
 
 ROOT = Path(__file__).resolve().parent
@@ -19,6 +20,7 @@ CONFIG_FILE = ROOT / "commute_config.json"
 REPORT_DIR = ROOT / "commute_reports"
 WEATHER_API = "https://api.open-meteo.com/v1/forecast"
 AMAP_GEOCODE_API = "https://restapi.amap.com/v3/geocode/geo"
+AMAP_CONVERT_API = "https://restapi.amap.com/v3/assistant/coordinate/convert"
 AMAP_DRIVING_API = "https://restapi.amap.com/v5/direction/driving"
 TIMEOUT_SECONDS = 30
 MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
@@ -132,7 +134,7 @@ def fetch_driving_routes(config: dict) -> dict:
     destination_address = config.get("destination", "上海市闵行区上海交通大学闵行校区")
     origin = geocode_landmark(origin_address, city, amap_key)
     destination = geocode_landmark(destination_address, city, amap_key)
-    return get_json(
+    route_data = get_json(
         AMAP_DRIVING_API,
         {
             "key": amap_key,
@@ -143,6 +145,13 @@ def fetch_driving_routes(config: dict) -> dict:
         },
         "高德驾车路线服务",
     )
+    record_snapshot(
+        origin,
+        destination,
+        str(config.get("route_strategy", 0)),
+        (route_data.get("route") or {}).get("paths") or [],
+    )
+    return route_data
 
 
 def summarize_routes(route_data: dict, max_routes: int = 3) -> list[dict]:
