@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import html
+import argparse
 import json
 import math
 import os
 import re
+import sqlite3
 import ssl
 import threading
 import webbrowser
@@ -17,7 +19,7 @@ from urllib.parse import parse_qs, urlencode
 
 from commute_assistant import AMAP_DRIVING_API, AMAP_GEOCODE_API, get_json
 from commute_assistant import AMAP_CONVERT_API
-from route_history import estimate as estimate_route_history, record_snapshot
+from route_history import estimate as estimate_route_history, record_snapshot, route_identity
 
 
 ROOT = Path(__file__).resolve().parent
@@ -39,6 +41,11 @@ FACILITY_CATEGORIES = {
     "repair": ("汽车维修", "汽车维修|汽车修理"),
     "food": ("餐饮 / 快餐", "餐饮|快餐"),
 }
+COMMUTE_PRESETS = {
+    "outbound": ("上海市普陀区桃浦镇", "上海交通大学闵行校区"),
+    "return": ("上海交通大学闵行校区", "上海市普陀区桃浦镇"),
+}
+ROUTE_DIRECTIONS = {"outbound": "去程", "return": "返程", "custom": "当前路线"}
 STRATEGIES = {
     "0": "时间优先（与定时简报一致）",
     "32": "高德默认推荐",
@@ -224,7 +231,7 @@ def query_routes(origin: str, destination: str, strategy: str, amap_key: str, vi
             "destination": destination,
             "strategy": strategy,
             "alternative_route": 3,
-            "show_fields": "cost,tmcs,navi",
+            "show_fields": "cost,tmcs,navi,polyline",
     }
     if via_points:
         params["waypoints"] = ";".join(via_points)
@@ -248,7 +255,9 @@ button,.button{{display:inline-flex;align-items:center;justify-content:center;mi
 .via-point-row{{display:grid;grid-template-columns:minmax(0,2fr) minmax(130px,1fr) minmax(130px,1fr) auto;gap:10px;align-items:end;margin:9px 0}}.via-point-row input,.via-point-row select{{min-width:0}}.via-point-row label{{font-size:14px;margin:3px 0 5px}}.via-point-row button,.secondary{{background:#eaf1f6;color:#29465d;padding:8px 13px;margin-top:0;min-height:40px}}.via-point-row button:hover,.secondary:hover{{background:#dce9f2;color:#173a56;box-shadow:none}}
 .facility-buttons{{display:flex;gap:9px;flex-wrap:wrap}}.facility-search-form button{{margin-top:5px;min-height:40px;padding:8px 13px}}.facility-row{{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--line);padding:12px 0}}.facility-row button{{white-space:nowrap;margin:0}}
 .facility-group{{border-top:1px solid var(--line);padding-top:16px;margin-top:16px}}.facility-status{{font-size:14px}}
+.direction-picker{{display:flex;gap:9px;flex-wrap:wrap;margin:6px 0 18px}}.direction-picker button{{margin:0;background:#eaf1f6;color:#29465d}}.direction-picker button[aria-pressed="true"]{{background:var(--blue);color:#fff;box-shadow:0 4px 12px #1769aa25}}.direction-banner{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}.direction-banner .badge{{background:#e5f3eb;color:#21613d}}
 .route-head{{display:flex;justify-content:space-between;gap:15px;align-items:center;flex-wrap:wrap}}.metric{{font-size:25px;font-weight:760;letter-spacing:-.025em;color:#123f61}}.badge{{display:inline-block;background:#eaf4fb;color:#165d91;padding:4px 10px;border-radius:99px;margin:3px;font-size:13px;font-weight:650}}
+.route-comparison{{border-radius:10px;background:#f0f6fa;color:#294d66;padding:10px 13px;font-weight:650;margin:12px 0}}
 .traffic{{color:#a44321}}details{{border-top:1px solid var(--line);margin-top:18px;padding-top:13px}}summary{{cursor:pointer;font-weight:680;color:#245675}}summary:hover{{color:var(--blue-dark)}}ol{{padding-left:25px}}li{{margin:9px 0;padding-left:3px}}li::marker{{color:var(--blue);font-weight:700}}.error{{border-color:#e9aaa4;background:#fff7f6;color:#8f2f25}}.notice{{background:#eef6fb;border:1px solid #d9eaf5;border-left:4px solid var(--blue);border-radius:8px;padding:12px 15px;margin-top:16px;color:#38566b}}
 @media(max-width:680px){{main{{margin:24px auto;padding:0 15px}}.card{{padding:18px;border-radius:15px;margin:14px 0}}.grid{{grid-template-columns:1fr;gap:4px}}.via-point-row{{grid-template-columns:1fr 1fr;gap:8px}}.via-point-row button{{justify-self:start}}.facility-row{{align-items:flex-start;flex-direction:column}}h1{{font-size:28px}}}}
 </style></head><body><main>{content}</main></body></html>"""
@@ -261,14 +270,19 @@ def strategy_options(selected: str) -> str:
     )
 
 
-def search_form(origin: str = "", destination: str = "", strategy: str = "32", departure_time: str = "", origin_coords: str = "", destination_scope: str = "shanghai", destination_city: str = "", via_points: list[tuple[str, str, str]] | None = None) -> str:
+def search_form(origin: str = "", destination: str = "", strategy: str = "32", departure_time: str = "", origin_coords: str = "", destination_scope: str = "shanghai", destination_city: str = "", via_points: list[tuple[str, str, str]] | None = None, direction: str = "outbound") -> str:
+    if not origin and not destination:
+        origin, destination = COMMUTE_PRESETS["outbound"]
+    if direction not in ROUTE_DIRECTIONS:
+        direction = "custom"
     if destination_scope not in {"shanghai", "other"}:
         destination_scope = "shanghai"
     city_required = " required" if destination_scope == "other" else ""
     via_points = via_points or []
     via_rows = "".join(via_point_row(*point) for point in via_points) or via_point_row()
     return f"""<section class="card"><form method="post" action="/">
-<div class="grid"><div><label for="origin">出发地</label><input id="origin" name="origin" required maxlength="120" value="{esc(origin)}" placeholder="例如：上海市普陀区真北路与古浪路">
+<label>常用路线快捷填入</label><div class="direction-picker" role="group" aria-label="常用路线快捷填入"><button type="button" class="direction-choice" data-direction="outbound" aria-pressed="{'true' if direction == 'outbound' else 'false'}">填入去程</button><button type="button" class="direction-choice" data-direction="return" aria-pressed="{'true' if direction == 'return' else 'false'}">填入返程</button></div><input type="hidden" id="route_direction" name="route_direction" value="{esc(direction)}"><p class="muted">快捷填入后仍可修改起点和目的地；修改后结果会按实际路线显示。</p>
+<div class="grid"><div><label for="origin">出发地</label><input id="origin" name="origin" required maxlength="120" value="{esc(origin)}" placeholder="例如：上海市普陀区桃浦镇">
 <input type="hidden" id="origin_coords" name="origin_coords" value="{esc(origin_coords)}"><button type="button" id="use-current-location">使用当前位置</button><p id="location-status" class="muted" aria-live="polite">点击后浏览器会请求定位权限；坐标仅用于本次查询，会发送给高德，不写入本机历史样本。</p></div>
 <div><label for="destination_scope">目的地城市范围</label><select id="destination_scope" name="destination_scope"><option value="shanghai"{" selected" if destination_scope == "shanghai" else ""}>上海市内</option><option value="other"{" selected" if destination_scope == "other" else ""}>其他城市</option></select>
 <div id="destination_city_wrap"{" hidden" if destination_scope == "shanghai" else ""}><label for="destination_city">目的地城市</label><input id="destination_city" name="destination_city" maxlength="60" value="{esc(destination_city)}" placeholder="例如：苏州市、杭州市"{city_required}></div>
@@ -276,8 +290,42 @@ def search_form(origin: str = "", destination: str = "", strategy: str = "32", d
 <div id="via-points"><label>途经点（可选，按顺序经过）</label>{via_rows}</div><button type="button" id="add-via-point" class="secondary">+ 添加途经点</button>
 <label for="strategy">路线偏好</label><select id="strategy" name="strategy">{strategy_options(strategy)}</select>
 <label for="departure_time">计划出发时间（留空查询当前路况）</label><input id="departure_time" name="departure_time" type="datetime-local" value="{esc(departure_time)}">
-<p class="muted">选择未来时间后，助手会根据本机积累的相近星期和时段记录估算；样本不足时会明确提示。</p>
-<button type="submit">查询路线</button></form></section>{DESTINATION_SCOPE_SCRIPT}{LOCATION_BUTTON_SCRIPT}{VIA_POINTS_SCRIPT}"""
+<p class="muted">选择未来时间后，助手会汇总本机相近星期和时段的历史地图预计值；这不是实际行程耗时或未来实时预测，样本不足时会明确提示。</p>
+<button type="submit">查询路线</button></form></section>{ROUTE_DIRECTION_SCRIPT}{DESTINATION_SCOPE_SCRIPT}{LOCATION_BUTTON_SCRIPT}{VIA_POINTS_SCRIPT}"""
+
+
+ROUTE_DIRECTION_SCRIPT = """<script>
+(() => {
+  const buttons = document.querySelectorAll('.direction-choice');
+  const direction = document.getElementById('route_direction');
+  const origin = document.getElementById('origin');
+  const destination = document.getElementById('destination');
+  const originCoords = document.getElementById('origin_coords');
+  const destinationScope = document.getElementById('destination_scope');
+  const destinationCity = document.getElementById('destination_city');
+  const presets = {
+    outbound: ['上海市普陀区桃浦镇', '上海交通大学闵行校区'],
+    return: ['上海交通大学闵行校区', '上海市普陀区桃浦镇']
+  };
+  const select = (value) => {
+    direction.value = value;
+    buttons.forEach(button => button.setAttribute('aria-pressed', String(button.dataset.direction === value)));
+  };
+  buttons.forEach(button => button.addEventListener('click', () => {
+    const value = button.dataset.direction;
+    if (presets[value]) {
+      [origin.value, destination.value] = presets[value];
+      originCoords.value = '';
+      destinationScope.value = 'shanghai';
+      destinationCity.value = '';
+      destinationScope.dispatchEvent(new Event('change'));
+    }
+    select(value);
+  }));
+  [origin, destination].forEach(input => input.addEventListener('input', () => select('custom')));
+  [origin, destination].forEach(input => input.addEventListener('change', () => select('custom')));
+})();
+</script>"""
 
 
 VIA_POINTS_SCRIPT = """<script>
@@ -378,6 +426,7 @@ LOCATION_BUTTON_SCRIPT = """<script>
       coordinateField.value = `${longitude},${latitude}`;
       const accuracy = Math.max(1, Math.round(position.coords.accuracy));
       input.value = `当前位置（定位精度约 ${accuracy} 米）`;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
       status.textContent = '已获取位置。确认起点无误后提交；如位置不准，可手动修改起点。';
       button.disabled = false;
     }, (error) => {
@@ -394,7 +443,7 @@ LOCATION_BUTTON_SCRIPT = """<script>
 </script>"""
 
 
-def location_picker(origin: str, destination: str, strategy: str, departure_time: str, origin_coords: str, destination_scope: str, destination_city: str, origin_options: list[dict], destination_options: list[dict], via_options: list[tuple[str, list[dict], str, str]]) -> str:
+def location_picker(origin: str, destination: str, strategy: str, departure_time: str, origin_coords: str, destination_scope: str, destination_city: str, origin_options: list[dict], destination_options: list[dict], via_options: list[tuple[str, list[dict], str, str]], direction: str = "outbound") -> str:
     def options(items: list[dict], field: str) -> str:
         return "".join(
             f'<option value="{esc(item["location"])}">{esc(item["name"])} · {esc(item["district"])} · {esc(item["level"])}</option>'
@@ -411,7 +460,7 @@ def location_picker(origin: str, destination: str, strategy: str, departure_time
             f'<select id="via_point_location_{index}" name="via_point_location_{index}">{options(items, f"via_point_location_{index}")}</select>'
         )
     return f"""<section class="card"><h2>确认地点</h2><p class="muted">高德可能把同一名称匹配到不同位置。请确认起点、途经点和目的地；途经点会按列表顺序经过。</p>
-<form method="post" action="/route"><input type="hidden" name="origin" value="{esc(origin)}"><input type="hidden" name="destination" value="{esc(destination)}"><input type="hidden" name="strategy" value="{esc(strategy)}"><input type="hidden" name="departure_time" value="{esc(departure_time)}"><input type="hidden" name="origin_coords" value="{esc(origin_coords)}"><input type="hidden" name="destination_scope" value="{esc(destination_scope)}"><input type="hidden" name="destination_city" value="{esc(destination_city)}">
+<form method="post" action="/route"><input type="hidden" name="origin" value="{esc(origin)}"><input type="hidden" name="destination" value="{esc(destination)}"><input type="hidden" name="strategy" value="{esc(strategy)}"><input type="hidden" name="departure_time" value="{esc(departure_time)}"><input type="hidden" name="origin_coords" value="{esc(origin_coords)}"><input type="hidden" name="destination_scope" value="{esc(destination_scope)}"><input type="hidden" name="destination_city" value="{esc(destination_city)}"><input type="hidden" name="route_direction" value="{esc(direction)}">
 <label for="origin_location">出发地：{esc(origin)}</label><select id="origin_location" name="origin_location">{options(origin_options, "origin_location")}</select>
 <label for="destination_location">目的地：{esc(destination)}</label><select id="destination_location" name="destination_location">{options(destination_options, "destination_location")}</select>
 <input type="hidden" name="via_point_count" value="{len(via_options)}">{''.join(via_fields)}
@@ -422,13 +471,13 @@ def trip_context_fields(origin: str, destination: str, strategy: str, departure_
                         destination_scope: str, destination_city: str, origin_location: str,
                         destination_location: str, via_locations: list[str], via_names: list[str],
                         via_scopes: list[str], via_cities: list[str], route_destination: str = "",
-                        route_destination_name: str = "") -> str:
+                        route_destination_name: str = "", direction: str = "outbound") -> str:
     fields = [
         ("origin", origin), ("destination", destination), ("strategy", strategy),
         ("departure_time", departure_time), ("origin_coords", origin_coords),
         ("destination_scope", destination_scope), ("destination_city", destination_city),
         ("origin_location", origin_location), ("destination_location", destination_location),
-        ("via_point_count", str(len(via_locations))),
+        ("via_point_count", str(len(via_locations))), ("route_direction", direction),
     ]
     if route_destination:
         fields.extend([
@@ -451,15 +500,21 @@ def trip_context_fields(origin: str, destination: str, strategy: str, departure_
     return fields_html
 
 
+def direction_banner(direction: str, origin: str, destination: str) -> str:
+    label = ROUTE_DIRECTIONS.get(direction, ROUTE_DIRECTIONS["custom"])
+    return (f'<section class="card direction-banner"><span class="badge">{esc(label)}</span>'
+            f'<strong>{esc(origin)} → {esc(destination)}</strong></section>')
+
+
 def arrival_picker(origin: str, destination: str, strategy: str, departure_time: str, origin_coords: str,
                    destination_scope: str, destination_city: str, origin_location: str,
                    destination_location: str, via_locations: list[str], via_names: list[str],
                    via_scopes: list[str], via_cities: list[str], parking: list[dict],
-                   search_message: str = "") -> str:
+                   search_message: str = "", direction: str = "outbound") -> str:
     direct_fields = trip_context_fields(
         origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city,
         origin_location, destination_location, via_locations, via_names, via_scopes, via_cities,
-        destination_location, destination,
+        destination_location, destination, direction,
     )
     options = [
         '<form method="post" action="/route" class="card"><h2>到目的地</h2>'
@@ -496,14 +551,14 @@ def facility_search_controls(origin: str, destination: str, strategy: str, depar
                              destination_scope: str, destination_city: str, origin_location: str,
                              destination_location: str, route_destination: str, route_destination_name: str,
                              via_locations: list[str], via_names: list[str], via_scopes: list[str],
-                             via_cities: list[str]) -> str:
+                             via_cities: list[str], direction: str = "outbound") -> str:
     destination_buttons = []
     current_buttons = []
     for category, (label, _) in FACILITY_CATEGORIES.items():
         context = trip_context_fields(
             origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city,
             origin_location, destination_location, via_locations, via_names, via_scopes, via_cities,
-            route_destination, route_destination_name,
+            route_destination, route_destination_name, direction,
         )
         destination_buttons.append(
             f'<form method="post" action="/facilities" class="facility-search-form">{context}'
@@ -514,7 +569,7 @@ def facility_search_controls(origin: str, destination: str, strategy: str, depar
         current_context = trip_context_fields(
             origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city,
             origin_location, destination_location, via_locations, via_names, via_scopes, via_cities,
-            route_destination, route_destination_name,
+            route_destination, route_destination_name, direction,
         )
         current_buttons.append(
             f'<form method="post" action="/facilities" class="facility-search-form current-location-facility-form">{current_context}'
@@ -574,10 +629,17 @@ def render_facilities(facilities: list[dict], category: str, origin: str, destin
                       origin_location: str, destination_location: str, route_destination: str,
                       route_destination_name: str, via_locations: list[str], via_names: list[str],
                       via_scopes: list[str], via_cities: list[str], center_source: str,
-                      current_center: str = "", current_gps: str = "") -> str:
+                      current_center: str = "", current_gps: str = "", direction: str = "outbound",
+                      error_message: str = "") -> str:
     label = FACILITY_CATEGORIES[category][0]
+    facility_direction = direction if center_source == "destination" else "custom"
     center_label = "当前位置" if center_source == "current" else "目的地附近"
     if not facilities:
+        if error_message:
+            return (
+                f'<section class="card error"><h2>{esc(center_label)}的{esc(label)}暂不可用</h2>'
+                f'<p>{esc(error_message)}</p><p>可以稍后重试，也可以返回路线查询继续使用。</p></section>'
+            )
         return f'<section class="card"><h2>{esc(center_label)}的{esc(label)}</h2><p>5 公里范围内没有找到相关地点。</p></section>'
     rows = []
     for item in facilities:
@@ -588,12 +650,13 @@ def render_facilities(facilities: list[dict], category: str, origin: str, destin
             context = trip_context_fields(
                 "当前位置", item["name"], strategy, "", current_gps, "other", item.get("city") or "上海",
                 current_center, item["location"], [], [], [], [], item["location"], item["name"],
+                facility_direction,
             )
         else:
             context = trip_context_fields(
                 origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city,
                 origin_location, destination_location, via_locations, via_names, via_scopes, via_cities,
-                item["location"], item["name"],
+                item["location"], item["name"], facility_direction,
             )
         rows.append(
             '<form method="post" action="/route" class="facility-row"><div>'
@@ -639,7 +702,7 @@ def simplify_step_instruction(step: dict) -> str:
 
 
 def render_history_estimate(data: dict, origin_name: str, destination_name: str, strategy: str, departure_at: datetime, via_names: list[str] | None = None, route_destination_name: str = "") -> str:
-    heading = (f"<section class=\"card\"><h2>未来路况估算</h2><p><strong>计划出发：</strong>"
+    heading = (f"<section class=\"card\"><h2>历史地图预计值参考</h2><p><strong>计划出发：</strong>"
                f"{esc(departure_at.strftime('%Y-%m-%d %H:%M'))}</p><p><strong>起点：</strong>{esc(origin_name)}</p>"
                f"<p><strong>目的地：</strong>{esc(destination_name)}</p>"
                + (f"<p><strong>实际导航终点：</strong>{esc(route_destination_name)}</p>"
@@ -647,11 +710,18 @@ def render_history_estimate(data: dict, origin_name: str, destination_name: str,
                + (f"<p><strong>途经：</strong>{' → '.join(esc(name) for name in via_names)}</p>" if via_names else "")
                + f"<p>路线偏好：{esc(STRATEGIES.get(strategy, '高德推荐'))}</p>")
     if not data.get("enough_data"):
-        count = data.get("sample_days", 0)
+        route_day_text = "；".join(
+            f"路径 {esc(item['route_id'][-8:])}：{item['sample_days']} 天"
+            for item in data.get("route_days", [])
+        ) or "目前还没有可稳定识别的路线样本"
+        unmatched_note = (
+            "旧记录或未返回路线几何的记录无法确认属于哪条路线，因此未纳入路线历史估算。"
+            if data.get("unmatched_routes") else ""
+        )
         return heading + (
-            f"<p>目前只有 {count} 个符合条件的历史日期，至少需要 3 个不同日期的记录才能给出估算。</p>"
-            "<div class=\"notice\">请继续在出发时查询实时路线，或运行早晚定时简报积累样本。记录只保存在这台电脑。"
-            "在样本足够前，助手不会用当前路况冒充未来预测。</div></section>"
+            f"<p>路线样本日期：{route_day_text}。每条路线至少需要 {data.get('needed_days', 3)} 个不同日期的记录，才显示该路线的历史参考值。</p>"
+            "<div class=\"notice\">历史记录是高德当时返回的预计耗时、距离、收费和路况，不是实际行程记录，也不是未来实时路况预测。"
+            f"{esc(unmatched_note)}请继续在出发时查询路线，或运行早晚定时简报积累历史地图查询样本；记录只保存在这台电脑。</div></section>"
         )
     cards = []
     for route in data.get("routes", []):
@@ -666,37 +736,81 @@ def render_history_estimate(data: dict, origin_name: str, destination_name: str,
         roads = route.get("slow_roads") or []
         roads_text = "、".join(esc(road) for road in roads[:6]) if roads else "历史样本没有稳定记录到固定拥堵路段"
         cards.append(
-            f"<section class=\"card\"><h2>历史路线 {route['index']}</h2>"
+            f"<section class=\"card\"><h2>历史路径 {esc(route['route_label'])}</h2>"
             f"<p class=\"metric\">{esc(duration_text)}<span class=\"muted\">{esc(distance_text)}</span></p>"
             f"<p>历史收费中位数：{esc(toll_text)}</p><p>历史缓行/拥堵路段中位数：{slow_count} 段</p>"
-            f"<p>常见需留意道路：{roads_text}</p><p class=\"muted\">参考 {route['sample_count']} 条相近时段记录</p></section>"
+            f"<p>常见需留意道路：{roads_text}</p><p class=\"muted\">覆盖 {route['sample_days']} 个不同日期，共 {route['sample_count']} 条记录（每日先合并，再计算跨日中位数）</p></section>"
         )
     return heading + (
-        f"<p>估算基于 {data['sample_days']} 个不同日期的记录；耗时与收费显示历史中位数，不是高德实时预测。</p></section>"
+        f"<p>参考 {data['sample_days']} 个不同日期的高德地图查询记录。下列耗时、距离、收费和路况是历史地图预计值的统计，不代表实际行程结果或未来实时预测。</p></section>"
         + "".join(cards)
         + '<section class="card notice">交通会受事故、天气、施工和临时管制影响。请在出发前再查实时导航。</section>'
     )
 
 
-def render_routes(data: dict, origin_name: str, destination_name: str, strategy: str, via_names: list[str] | None = None, route_destination_name: str = "") -> str:
+def render_routes(data: dict, origin_name: str, destination_name: str, strategy: str, via_names: list[str] | None = None, route_destination_name: str = "", demo_mode: bool = False) -> str:
     paths = (data.get("route") or {}).get("paths") or []
     if not paths:
         raise RuntimeError("高德没有返回可用路线，请换一个附近的地标再试。")
-    cards = []
-    for index, path in enumerate(paths[:3], start=1):
+    paths = paths[:3]
+
+    def number_or_none(value: object) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def money_text(value: float) -> str:
+        return f"{value:.0f}" if value.is_integer() else f"{value:.2f}"
+
+    metrics = []
+    for path in paths:
         cost = path.get("cost") or {}
-        duration = cost.get("duration")
-        try:
-            duration_text = f"{round(int(duration) / 60)} 分钟" if duration is not None else "暂无"
-        except (TypeError, ValueError):
-            duration_text = "暂无"
-        try:
-            distance_text = f"{int(path.get('distance', 0)) / 1000:.1f} 公里"
-        except (TypeError, ValueError):
-            distance_text = "暂无"
-        tolls = cost.get("tolls", "未知")
-        if str(tolls) not in ("", "未知", "None"):
-            tolls = f"{tolls} 元"
+        metrics.append({
+            "duration": number_or_none(cost.get("duration")),
+            "distance": number_or_none(path.get("distance")),
+            "tolls": number_or_none(cost.get("tolls")),
+        })
+    baseline = metrics[0]
+    cards = []
+    for index, (path, metric) in enumerate(zip(paths, metrics), start=1):
+        cost = path.get("cost") or {}
+        stable_route_id = route_identity(path) if not demo_mode else None
+        identity_badge = (
+            '<span class="badge">模拟路线</span>' if demo_mode else (
+                f'<span class="badge">历史匹配编号 {esc(stable_route_id[-8:])}</span>'
+                if stable_route_id else '<span class="badge">暂无法匹配历史路线</span>'
+            )
+        )
+        duration_text = f"{round(metric['duration'] / 60)} 分钟" if metric["duration"] is not None else "暂无"
+        distance_text = f"{metric['distance'] / 1000:.1f} 公里" if metric["distance"] is not None else "暂无"
+        tolls_text = f"{money_text(metric['tolls'])} 元" if metric["tolls"] is not None else "暂无"
+
+        comparisons = []
+        if index == 1:
+            comparisons.append("路线1为本次比较基准")
+        else:
+            if metric["duration"] is not None and baseline["duration"] is not None:
+                delta_minutes = round((metric["duration"] - baseline["duration"]) / 60)
+                if delta_minutes > 0:
+                    comparisons.append(f"预计耗时比路线1多 {delta_minutes} 分钟")
+                elif delta_minutes < 0:
+                    comparisons.append(f"预计耗时比路线1节省 {abs(delta_minutes)} 分钟")
+                else:
+                    comparisons.append("预计耗时与路线1相近（分钟级取整后相同）")
+            else:
+                comparisons.append("预计耗时差暂无")
+            if metric["tolls"] is not None and baseline["tolls"] is not None:
+                delta_tolls = metric["tolls"] - baseline["tolls"]
+                if delta_tolls > 0:
+                    comparisons.append(f"收费比路线1多 {money_text(delta_tolls)} 元")
+                elif delta_tolls < 0:
+                    comparisons.append(f"收费比路线1少 {money_text(abs(delta_tolls))} 元")
+                else:
+                    comparisons.append("收费与路线1相同")
+            else:
+                comparisons.append("收费差暂无")
+        comparison_html = '<p class="route-comparison">' + "；".join(esc(item) for item in comparisons) + "</p>"
 
         steps_html = []
         congested = []
@@ -717,15 +831,15 @@ def render_routes(data: dict, origin_name: str, destination_name: str, strategy:
             if congested else '<p class="muted">返回数据中没有标出缓行或拥堵路段。</p>'
         )
         step_details = "".join(steps_html) or '<li class="muted">高德没有返回分段指引。</li>'
-        cards.append(f"""<section class="card"><div class="route-head"><h2>路线 {index}</h2><span class="badge">{esc(STRATEGIES.get(strategy, "高德推荐"))}</span></div>
+        cards.append(f"""<section class="card"><div class="route-head"><h2>路线 {index}</h2><span><span class="badge">{esc(STRATEGIES.get(strategy, "高德推荐"))}</span>{identity_badge}</span></div>
 <p class="metric">{esc(duration_text)} <span class="muted">· {esc(distance_text)}</span></p>
-<p>预计收费：{esc(tolls)}</p>{traffic_summary}<details><summary>查看逐段路线指引</summary><ol>{step_details}</ol></details></section>""")
+<p>预计收费：{esc(tolls_text)}</p>{comparison_html}{traffic_summary}<details><summary>查看逐段路线指引</summary><ol>{step_details}</ol></details></section>""")
     # Use the Windows machine's local clock; Windows Python may not bundle IANA tzdata.
     timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %z")
     via_summary = f"<p><strong>途经：</strong>{' → '.join(esc(name) for name in via_names)}</p>" if via_names else ""
     arrival_summary = f"<p><strong>实际导航终点：</strong>{esc(route_destination_name)}</p>" if route_destination_name and route_destination_name != destination_name else ""
     return f"""<section class="card"><h2>查询结果</h2><p><strong>起点：</strong>{esc(origin_name)}</p>{via_summary}<p><strong>目的地：</strong>{esc(destination_name)}</p>{arrival_summary}<p class="muted">查询时间：{timestamp}（本机时间）</p>
-<div class="notice">这是查询时高德返回的路线与路况，不代表你未来出发时的路况。出发前请打开导航复核。</div></section>{''.join(cards)}"""
+<div class="notice">路线间的耗时和收费差值以路线1为参照，根据本次高德返回数据计算；预计值不代表实际行程。路况也仅代表查询时刻，不代表你未来出发时的路况，出发前请打开导航复核。</div></section>{''.join(cards)}"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -749,9 +863,10 @@ class Handler(BaseHTTPRequestHandler):
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             config = {}
+        default_origin, default_destination = COMMUTE_PRESETS["outbound"]
         self.send_page(
             '<h1>上海自驾路线助手</h1><p class="muted">可查询当前路线和路况，也可根据本机历史记录估算未来出发时段。</p>'
-            + search_form(config.get("origin", ""), config.get("destination", ""))
+            + search_form(config.get("origin", default_origin), config.get("destination", default_destination))
             + '<p class="muted">查询通过高德 Web 服务完成；你的 Key 保存在本机，不会发送到网页浏览器。</p>'
         )
 
@@ -773,9 +888,11 @@ class Handler(BaseHTTPRequestHandler):
         strategy = "32"
         departure_time = ""
         origin_coords = ""
+        direction = "outbound"
         destination_scope = "shanghai"
         destination_city = ""
         via_specs: list[tuple[str, str, str]] = []
+        history_warning = ""
         try:
             form = self.read_form()
             origin = form.get("origin", "").strip()
@@ -783,6 +900,9 @@ class Handler(BaseHTTPRequestHandler):
             strategy = form.get("strategy", "32")
             departure_time = form.get("departure_time", "").strip()
             origin_coords = form.get("origin_coords", "").strip()
+            direction = form.get("route_direction", "custom").strip()
+            if direction not in ROUTE_DIRECTIONS:
+                direction = "custom"
             destination_scope = form.get("destination_scope", "shanghai").strip()
             destination_city = form.get("destination_city", "").strip()
             def field_values(name: str) -> list[str]:
@@ -859,8 +979,8 @@ class Handler(BaseHTTPRequestHandler):
                 ]
                 self.send_page(
                     '<h1>上海自驾路线助手</h1>'
-                    + location_picker(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, origin_options, destination_options, via_options)
-                    + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs)
+                    + location_picker(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, origin_options, destination_options, via_options, direction)
+                    + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs, direction)
                 )
                 return
             if self.path in {"/route", "/facilities"}:
@@ -906,11 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
                         origin, destination, strategy, departure_time, origin_coords,
                         destination_scope, destination_city, str(origin_location),
                         str(destination_location), via_locations, via_names, via_scopes,
-                        via_cities, parking, parking_error,
+                        via_cities, parking, parking_error, direction,
                     )
-                    self.send_page('<h1>上海自驾路线助手</h1>' + body + search_form(
+                    self.send_page('<h1>上海自驾路线助手</h1>' + direction_banner(direction, origin, destination) + body + search_form(
                         origin, destination, strategy, departure_time, origin_coords,
-                        destination_scope, destination_city, via_specs,
+                        destination_scope, destination_city, via_specs, direction,
                     ))
                     return
 
@@ -945,47 +1065,60 @@ class Handler(BaseHTTPRequestHandler):
                         destination_scope, destination_city, str(origin_location),
                         str(destination_location), route_destination, route_destination_name,
                         via_locations, via_names, via_scopes, via_cities, center_source,
-                        facility_center if center_source == "current" else "", current_gps,
+                        facility_center if center_source == "current" else "", current_gps, direction,
+                        facility_error,
                     )
-                    if facility_error:
-                        result += f'<section class="card error"><p>周边设施暂时无法查询：{esc(facility_error)}</p><p>请确认高德 Web 服务 Key 已开通 POI 搜索权限。</p></section>'
                     result += facility_search_controls(
                         origin, destination, strategy, departure_time, origin_coords,
                         destination_scope, destination_city, str(origin_location),
                         str(destination_location), route_destination, route_destination_name,
-                        via_locations, via_names, via_scopes, via_cities,
+                        via_locations, via_names, via_scopes, via_cities, direction,
                     )
-                    self.send_page('<h1>上海自驾路线助手</h1>' + result + search_form(
+                    self.send_page('<h1>上海自驾路线助手</h1>' + direction_banner(direction, origin, destination) + result + search_form(
                         origin, destination, strategy, departure_time, origin_coords,
-                        destination_scope, destination_city, via_specs,
+                        destination_scope, destination_city, via_specs, direction,
                     ))
                     return
 
                 selected_departure = parse_departure_time(departure_time)
                 if selected_departure:
-                    history = estimate_route_history(origin_location, route_destination, strategy, selected_departure, via_locations)
-                    result = render_history_estimate(history, origin, destination, strategy, selected_departure, via_names, route_destination_name)
+                    try:
+                        history = estimate_route_history(origin_location, route_destination, strategy, selected_departure, via_locations)
+                        result = render_history_estimate(history, origin, destination, strategy, selected_departure, via_names, route_destination_name)
+                    except sqlite3.Error as exc:
+                        print(f"本机历史路线数据库暂不可用：{type(exc).__name__}")
+                        result = (
+                            '<section class="card error"><h2>历史参考暂不可用</h2>'
+                            '<p>本机历史路线记录暂时无法读取，因此没有生成未来时段估算。实时路线查询不受影响；请检查本机历史数据库后重试。</p></section>'
+                        )
                 else:
                     data = query_routes(origin_location, route_destination, strategy, amap_key, via_locations)
                     paths = (data.get("route") or {}).get("paths") or []
                     if not origin_coords:
-                        record_snapshot(origin_location, route_destination, strategy, paths, via_points=via_locations)
+                        try:
+                            record_snapshot(origin_location, route_destination, strategy, paths, via_points=via_locations)
+                        except sqlite3.Error as exc:
+                            print(f"路线已查询成功，但本机历史记录未能保存：{type(exc).__name__}")
+                            history_warning = "本次实时路线已查询成功，但历史样本未能保存在本机；当前路线结果仍可正常查看。"
                     result = render_routes(data, origin, destination, strategy, via_names, route_destination_name)
+                result = direction_banner(direction, origin, destination) + result
+                if history_warning:
+                    result += f'<section class="card notice">{esc(history_warning)}</section>'
                 result += facility_search_controls(
                     origin, destination, strategy, departure_time, origin_coords,
                     destination_scope, destination_city, str(origin_location),
                     str(destination_location), route_destination, route_destination_name,
-                    via_locations, via_names, via_scopes, via_cities,
+                    via_locations, via_names, via_scopes, via_cities, direction,
                 )
                 self.send_page(
-                    '<h1>上海自驾路线助手</h1>' + result + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs)
+                    '<h1>上海自驾路线助手</h1>' + result + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs, direction)
                 )
                 return
             self.send_page('<section class="card"><h2>页面不存在</h2><a href="/">返回首页</a></section>', 404)
         except (ValueError, RuntimeError) as exc:
             self.send_page(
                 '<h1>上海自驾路线助手</h1><section class="card error"><h2>查询没有完成</h2><p>'
-                + esc(exc) + "</p></section>" + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs),
+                + esc(exc) + "</p></section>" + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs, direction),
                 400,
             )
         except Exception:
@@ -1001,16 +1134,135 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(
                 '<h1>上海自驾路线助手</h1><section class="card error"><h2>暂时无法查询</h2>'
                 f'<p>错误详情：{esc(detail)}</p><p>如需继续排查，请把启动窗口中的报错发给我；发送前确认没有包含任何 Key。</p></section>'
-                + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs),
+                + search_form(origin, destination, strategy, departure_time, origin_coords, destination_scope, destination_city, via_specs, direction),
                 500,
             )
 
+
+DEMO_LOCATIONS = {
+    "people_square": "上海市人民广场（演示起点）",
+    "xujiahui": "上海市徐家汇（演示起点）",
+    "hongqiao": "上海市虹桥火车站（演示终点）",
+    "lujiazui": "上海市陆家嘴（演示终点）",
+}
+
+
+def demo_form(origin: str = "people_square", destination: str = "hongqiao", preference: str = "time") -> str:
+    def option_group(items: tuple[tuple[str, str], ...], selected: str) -> str:
+        return "".join(
+            f'<option value="{esc(value)}"{" selected" if value == selected else ""}>{esc(label)}</option>'
+            for value, label in items
+        )
+
+    origins = (("people_square", DEMO_LOCATIONS["people_square"]), ("xujiahui", DEMO_LOCATIONS["xujiahui"]))
+    destinations = (("hongqiao", DEMO_LOCATIONS["hongqiao"]), ("lujiazui", DEMO_LOCATIONS["lujiazui"]))
+    preferences = (("time", "今天赶时间"), ("toll", "少交过路费"))
+    return f'''<h1>上海自驾通勤助手 · 离线演示</h1>
+<section class="card notice"><strong>离线演示模式</strong><br>以下地点、路线、耗时、收费和路况均为合成示例，不调用地图/天气服务，不用于真实出行。</section>
+<section class="card"><form method="post" action="/route">
+<label for="origin">示例出发地</label><select id="origin" name="origin">{option_group(origins, origin)}</select>
+<label for="destination">示例目的地</label><select id="destination" name="destination">{option_group(destinations, destination)}</select>
+<label for="preference">今天的偏好</label><select id="preference" name="preference">{option_group(preferences, preference)}</select>
+<button type="submit">查看模拟路线</button></form></section>
+<p class="muted">演示数据不会写入正式路线历史数据库。重新载入本页可开始新的演示。</p>'''
+
+
+DEMO_PATHS = [
+    {
+        "distance": "18400",
+        "cost": {"duration": "2280", "tolls": "12"},
+        "steps": [
+            {"road_name": "延安高架路（演示）", "instruction": "向西行驶", "navi": {"action": "直行"}, "tmcs": [{"tmc_status": "缓行"}]},
+            {"road_name": "虹桥路（演示）", "instruction": "向西北方向行驶", "navi": {"action": "右转"}, "tmcs": [{"tmc_status": "畅通"}]},
+        ],
+    },
+    {
+        "distance": "20100",
+        "cost": {"duration": "2520", "tolls": "0"},
+        "steps": [
+            {"road_name": "内环高架路（演示）", "instruction": "向西行驶", "navi": {"action": "直行"}, "tmcs": [{"tmc_status": "畅通"}]},
+            {"road_name": "沪青平公路（演示）", "instruction": "向西行驶", "navi": {"action": "左转"}, "tmcs": [{"tmc_status": "缓行"}]},
+        ],
+    },
+]
+
+
+class DemoHandler(BaseHTTPRequestHandler):
+    server_version = "CommuteAssistantDemo/1.0"
+
+    def send_page(self, body: str, status: int = 200) -> None:
+        encoded = page(body, title="上海自驾通勤助手 · 离线演示").encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_GET(self) -> None:
+        if self.path != "/":
+            self.send_page('<section class="card"><h2>页面不存在</h2><a href="/">返回演示首页</a></section>', 404)
+            return
+        self.send_page(demo_form())
+
+    def do_POST(self) -> None:
+        if self.path != "/route":
+            self.send_page('<section class="card error"><h2>演示操作不可用</h2><a href="/">返回演示首页</a></section>', 404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 8192:
+                raise ValueError("表单内容过长。")
+            form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            origin_id = form.get("origin", [""])[0]
+            destination_id = form.get("destination", [""])[0]
+            preference = form.get("preference", [""])[0]
+            if origin_id not in {"people_square", "xujiahui"}:
+                raise ValueError("请选择演示列表中的出发地。")
+            if destination_id not in {"hongqiao", "lujiazui"}:
+                raise ValueError("请选择演示列表中的目的地。")
+            if preference not in {"time", "toll"}:
+                raise ValueError("请选择有效的演示偏好。")
+            paths = DEMO_PATHS if preference == "time" else list(reversed(DEMO_PATHS))
+            strategy = "0" if preference == "time" else "36"
+            result = (
+                '<h1>上海自驾通勤助手 · 离线演示</h1>'
+                '<section class="card notice"><strong>合成演示结果</strong><br>路线指标和路况均为模拟数据；没有请求外部服务，也没有保存历史记录。</section>'
+                + render_routes(
+                    {"route": {"paths": paths}},
+                    DEMO_LOCATIONS[origin_id], DEMO_LOCATIONS[destination_id], strategy,
+                    demo_mode=True,
+                )
+                + '<section class="card"><a href="/">返回并更改演示选项</a></section>'
+            )
+            self.send_page(result)
+        except (UnicodeDecodeError, ValueError) as exc:
+            self.send_page(f'<h1>上海自驾通勤助手 · 离线演示</h1><section class="card error"><p>{esc(exc)}</p></section>{demo_form()}', 400)
+
     def log_message(self, fmt: str, *args: object) -> None:
         # Keep local logs free of submitted addresses and API credentials.
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {fmt % args}")
+        print(f"[离线演示 {datetime.now().strftime('%H:%M:%S')}] {fmt % args}")
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="上海自驾通勤路线助手")
+    parser.add_argument("--demo", action="store_true", help="启动不联网、不需要 API Key 的离线演示")
+    args = parser.parse_args()
+    if args.demo:
+        demo_port = 8766
+        server = ThreadingHTTPServer(("127.0.0.1", demo_port), DemoHandler)
+        url = f"http://localhost:{demo_port}"
+        print("已启动离线演示；所有路线和路况都是合成数据，不会访问网络或写入历史数据库。")
+        print(f"浏览器地址：{url}；按 Ctrl+C 停止。")
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("正在停止离线演示……")
+        finally:
+            server.server_close()
+        return
+
     if not os.getenv("AMAP_WEB_KEY"):
         raise SystemExit("没有检测到 AMAP_WEB_KEY。请通过 run_commute_web.ps1 启动网页助手。")
     server = ThreadingHTTPServer((HOST, PORT), Handler)

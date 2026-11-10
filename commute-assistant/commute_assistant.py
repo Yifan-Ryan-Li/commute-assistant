@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from openai import APIConnectionError, APITimeoutError, OpenAI
+from openai import OpenAI
 from route_history import record_snapshot
 
 
@@ -141,16 +142,22 @@ def fetch_driving_routes(config: dict) -> dict:
             "origin": origin,
             "destination": destination,
             "strategy": config.get("route_strategy", 0),
-            "show_fields": "cost,tmcs",
+            "show_fields": "cost,tmcs,polyline",
         },
         "高德驾车路线服务",
     )
-    record_snapshot(
-        origin,
-        destination,
-        str(config.get("route_strategy", 0)),
-        (route_data.get("route") or {}).get("paths") or [],
-    )
+    try:
+        record_snapshot(
+            origin,
+            destination,
+            str(config.get("route_strategy", 0)),
+            (route_data.get("route") or {}).get("paths") or [],
+        )
+    except sqlite3.Error as exc:
+        print(f"路线已查询成功，但本机历史记录未能保存：{type(exc).__name__}", file=sys.stderr)
+        route_data["_history_saved"] = False
+    else:
+        route_data["_history_saved"] = True
     return route_data
 
 
@@ -204,20 +211,50 @@ def period_rows(forecast: dict, date_text: str, start_hour: int, end_hour: int) 
     return rows
 
 
-def make_brief(config: dict, forecast: dict, route_data: dict, date_text: str, query_time: str) -> str:
-    morning = period_rows(
-        forecast, date_text, int(config["morning_start"]), int(config["morning_end"])
-    )
-    evening = period_rows(
-        forecast, date_text, int(config["evening_start"]), int(config["evening_end"])
-    )
-    routes = summarize_routes(route_data)
-    if not morning and not evening:
-        raise RuntimeError("天气数据里没有找到今天设置的通勤时段；可以稍后重试或检查时段设置。")
+def make_brief(
+    config: dict,
+    forecast: dict | None,
+    route_data: dict | None,
+    date_text: str,
+    query_time: str,
+    service_errors: dict[str, str] | None = None,
+) -> str:
+    service_errors = service_errors or {}
+    morning = []
+    evening = []
+    if forecast is not None:
+        try:
+            morning = period_rows(
+                forecast, date_text, int(config["morning_start"]), int(config["morning_end"])
+            )
+            evening = period_rows(
+                forecast, date_text, int(config["evening_start"]), int(config["evening_end"])
+            )
+            if not morning and not evening:
+                service_errors.setdefault("weather", "天气服务没有返回所设通勤时段的数据。")
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            print(f"天气数据格式不可用：{type(exc).__name__}", file=sys.stderr)
+            service_errors.setdefault("weather", "天气服务返回的数据暂时无法整理。")
+            morning = []
+            evening = []
+    routes = []
+    if route_data is not None:
+        try:
+            routes = summarize_routes(route_data)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            print(f"路线数据格式不可用：{type(exc).__name__}", file=sys.stderr)
+            service_errors.setdefault("routes", "高德没有返回可用路线数据。")
 
     input_data = {
         "city": config.get("city", "上海"),
         "date": date_text,
+        "service_status": {
+            "weather_available": bool(morning or evening),
+            "weather_issue": service_errors.get("weather", ""),
+            "routes_available": bool(routes),
+            "routes_issue": service_errors.get("routes", ""),
+            "route_history_saved": route_data.get("_history_saved") if route_data else None,
+        },
         "morning_peak": {"hours": f"{config['morning_start']}:00–{config['morning_end']}:00", "hourly_forecast": morning},
         "evening_peak": {"hours": f"{config['evening_start']}:00–{config['evening_end']}:00", "hourly_forecast": evening},
         "driving_routes_and_traffic_at_query_time": {
@@ -228,7 +265,8 @@ def make_brief(config: dict, forecast: dict, route_data: dict, date_text: str, q
         },
     }
     api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
+    has_source_data = bool(morning or evening or routes)
+    if api_key and has_source_data:
         try:
             response = OpenAI(timeout=30.0, max_retries=0).responses.create(
                 model=MODEL,
@@ -237,30 +275,60 @@ def make_brief(config: dict, forecast: dict, route_data: dict, date_text: str, q
                     "可以提示降雨、能见度、阵风、温度等驾驶相关天气因素，并建议预留注意力或查看车窗除雾；"
                     "路线耗时与路段拥堵状态只代表查询时刻，不是未来早晚高峰预测，也不包含事故或封路确认。"
                     "只能使用输入提供的路线和路况数据，不要编造；若返回多条路线，比较耗时、距离和拥堵路段。"
+                    "输入中的 service_status 会说明天气或路线数据是否缺失；缺失时要明确告知用户，不要猜测或编造。"
+                    "若路线查询成功但本机历史记录保存失败，也要明确说明路线结果仍可用，但本次不会用于后续历史估算。"
                     "简短清楚，并明确建议出发前用导航复核。"
                 ),
                 input=json.dumps(input_data, ensure_ascii=False),
             )
-            return response.output_text.strip()
-        except (APITimeoutError, APIConnectionError) as exc:
-            print(f"OpenAI 连接暂不可用，改用本地简报：{type(exc).__name__}", file=sys.stderr)
+            summary = response.output_text.strip()
+            if summary:
+                return summary
+            raise RuntimeError("AI 服务没有返回摘要文本。")
+        except Exception as exc:
+            print(f"OpenAI 摘要未能生成，改用本地简报：{type(exc).__name__}", file=sys.stderr)
     else:
-        print("未配置 OpenAI Key，改用本地简报。", file=sys.stderr)
+        reason = "未配置 OpenAI Key" if not api_key else "天气和路线数据均不可用"
+        print(f"{reason}，改用本地简报。", file=sys.stderr)
 
     return make_local_brief(input_data)
 
 
 def make_local_brief(input_data: dict) -> str:
     """Create a factual fallback brief when the OpenAI endpoint is unreachable."""
-    lines = ["AI 摘要服务暂时不可用，以下内容根据天气与高德返回数据整理。", ""]
+    lines = ["以下内容由本地规则根据当前可用数据整理。"]
+    status = input_data.get("service_status", {})
+    if status.get("weather_available"):
+        lines.append("- 天气数据：可用。")
+    else:
+        lines.append(f"- 天气数据：不可用。{status.get('weather_issue') or '本次没有可用的天气预报。'}")
+    if status.get("routes_available"):
+        lines.append("- 路线与路况数据：可用（仅代表查询时刻）。")
+        if status.get("route_history_saved") is False:
+            lines.append("- 本机历史样本：保存失败；本次路线结果可用，但不会进入后续历史估算。")
+    else:
+        lines.append(f"- 路线与路况数据：不可用。{status.get('routes_issue') or '本次没有可用的路线信息。'}")
+    if not os.getenv("OPENAI_API_KEY"):
+        lines.append("- AI 摘要：未配置 API Key，使用本地规则整理。")
+    lines.append("")
     for label, period in (("早高峰天气", input_data["morning_peak"]), ("晚高峰天气", input_data["evening_peak"])):
         rows = period["hourly_forecast"]
         if not rows:
             lines.append(f"- {label}：当前没有可用的逐小时预报。")
             continue
         weather = list(dict.fromkeys(row.get("weather", "天气状况未知") for row in rows))
-        temperatures = [row.get("temperature_2m") for row in rows if row.get("temperature_2m") is not None]
-        rain_chances = [row.get("precipitation_probability") for row in rows if row.get("precipitation_probability") is not None]
+        def numeric_values(field: str) -> list[float]:
+            values = []
+            for row in rows:
+                try:
+                    value = float(row[field])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                values.append(value)
+            return values
+
+        temperatures = numeric_values("temperature_2m")
+        rain_chances = numeric_values("precipitation_probability")
         parts = [f"{period['hours']}，天气：{'、'.join(weather)}"]
         if temperatures:
             parts.append(f"气温约 {min(temperatures):g}–{max(temperatures):g}°C")
@@ -288,28 +356,59 @@ def make_local_brief(input_data: dict) -> str:
 def main() -> int:
     try:
         config = load_config()
-        forecast = fetch_forecast(config)
         now = datetime.now()
         date_text = now.strftime("%Y-%m-%d")
-        route_data = fetch_driving_routes(config)
-        brief = make_brief(config, forecast, route_data, date_text, now.strftime("%H:%M"))
+        service_errors: dict[str, str] = {}
+        forecast = None
+        route_data = None
+        try:
+            forecast = fetch_forecast(config)
+            if not period_rows(forecast, date_text, int(config["morning_start"]), int(config["morning_end"])) \
+                    and not period_rows(forecast, date_text, int(config["evening_start"]), int(config["evening_end"])):
+                raise RuntimeError("天气服务没有返回所设通勤时段的数据。")
+        except Exception as exc:
+            print(f"天气服务不可用：{type(exc).__name__}", file=sys.stderr)
+            forecast = None
+            service_errors["weather"] = "天气服务暂时不可用或没有返回所需时段的数据。"
+        try:
+            route_data = fetch_driving_routes(config)
+            summarize_routes(route_data)
+        except Exception as exc:
+            print(f"路线服务不可用：{type(exc).__name__}", file=sys.stderr)
+            route_data = None
+            service_errors["routes"] = "高德路线服务暂时不可用或没有返回可用路线。"
+        brief = make_brief(config, forecast, route_data, date_text, now.strftime("%H:%M"), service_errors)
         REPORT_DIR.mkdir(exist_ok=True)
         report = REPORT_DIR / f"commute_{now.strftime('%Y-%m-%d_%H%M')}.md"
+        sources = []
+        if forecast is not None:
+            sources.append("Open-Meteo Forecast API 天气数据")
+        if route_data is not None:
+            sources.append("高德地理编码与驾车路线规划 API")
+        source_text = "；".join(sources) if sources else "本次天气和路线服务均未提供可用数据"
+        route_history_note = (
+            "；本机历史样本保存失败（本次路线结果仍可用）"
+            if route_data is not None and route_data.get("_history_saved") is False else ""
+        )
         lines = [
             f"# {config.get('city', '上海')}自驾通勤简报｜{date_text}",
             "",
             f"生成时间：{now.strftime('%H:%M')}（北京时间）",
+            f"数据状态：天气{'已获取' if forecast is not None else '暂不可用'}；驾车路线和查询时路况{'已获取' if route_data is not None else '暂不可用'}{route_history_note}。",
             f"天气查询区域：{config.get('weather_area', '上海市区级近似位置')}（非精确路线天气）",
             f"路线：{config.get('origin', '上海市普陀区真北路与古浪路交叉口')} → {config.get('destination', '上海市闵行区上海交通大学闵行校区')}（公开地标近似点）",
             "",
             brief,
             "",
             "---",
-            f"数据来源：Open-Meteo Forecast API；高德地理编码与驾车路线规划 API（查询时间：{now.strftime('%Y-%m-%d %H:%M')}）",
+            f"数据来源：{source_text}（查询时间：{now.strftime('%Y-%m-%d %H:%M')}）",
             "说明：路况仅代表查询时刻，不能代表未来早晚高峰；不提供事故/封路核验。路线起终点是地标近似点。出发前请用导航复核。",
         ]
         report.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"已生成通勤天气简报：{report}")
+        if forecast is None and route_data is None:
+            print("天气和路线服务本次均不可用。已保存错误说明报告，请查看稍后重试。", file=sys.stderr)
+            return 1
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"生成失败：{exc}", file=sys.stderr)
         return 1

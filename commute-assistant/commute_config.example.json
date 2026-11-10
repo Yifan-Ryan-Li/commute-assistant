@@ -8,7 +8,7 @@
   "evening_start": 17,
   "evening_end": 19,
   "route_city": "上海市",
-  "origin": "上海市普陀区真北路与古浪路交叉口",
-  "destination": "上海市闵行区上海交通大学闵行校区",
+  "origin": "上海市人民广场",
+  "destination": "上海市虹桥火车站",
   "route_strategy": 0
 }

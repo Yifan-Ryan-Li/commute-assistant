@@ -1,8 +1,9 @@
-"""Store local route observations and estimate future conditions from similar trips."""
+"""Store local map-estimate snapshots and summarize similar historical queries."""
 
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -13,6 +14,28 @@ from typing import Iterator
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "commute_history.sqlite3"
+MIN_ROUTE_DAYS = 3
+
+
+def route_identity(path: dict) -> str | None:
+    """Build a strict identity from the returned route geometry, not its list position."""
+    polyline = path.get("polyline")
+    if not isinstance(polyline, str) or not polyline.strip():
+        return None
+    points = []
+    try:
+        for item in polyline.split(";"):
+            longitude, latitude = item.split(",", 1)
+            point = (round(float(longitude), 5), round(float(latitude), 5))
+            if not points or point != points[-1]:
+                points.append(point)
+    except (TypeError, ValueError):
+        return None
+    if len(points) < 2:
+        return None
+    canonical = ";".join(f"{longitude:.5f},{latitude:.5f}" for longitude, latitude in points)
+    digest = hashlib.sha256(canonical.encode("ascii")).hexdigest()
+    return f"geo-v1:{digest}"
 
 
 def _connect() -> sqlite3.Connection:
@@ -59,10 +82,10 @@ def _database() -> Iterator[sqlite3.Connection]:
 
 
 def record_snapshot(origin: str, destination: str, strategy: str, paths: list[dict], observed_at: datetime | None = None, via_points: list[str] | None = None) -> None:
-    """Save a compact observation; coordinates and route metrics stay on this computer."""
+    """Save map-returned route estimates locally; actual trip duration is not collected."""
     observed_at = observed_at or datetime.now().astimezone()
     routes = []
-    for index, path in enumerate(paths[:3], start=1):
+    for path in paths[:3]:
         cost = path.get("cost") or {}
         try:
             duration = float(cost.get("duration")) / 60
@@ -86,7 +109,7 @@ def record_snapshot(origin: str, destination: str, strategy: str, paths: list[di
                 if road and status in ("缓行", "拥堵", "严重拥堵"):
                     roads.append(road)
         routes.append({
-            "index": index,
+            "route_id": route_identity(path),
             "duration_minutes": duration,
             "distance_km": distance,
             "tolls_yuan": tolls,
@@ -107,7 +130,7 @@ def record_snapshot(origin: str, destination: str, strategy: str, paths: list[di
 
 
 def estimate(origin: str, destination: str, strategy: str, departure_at: datetime, via_points: list[str] | None = None) -> dict:
-    """Return median route metrics from the same weekday and nearby time in the last 90 days."""
+    """Summarize historical map estimates for the same weekday and nearby time."""
     since = (datetime.now().date() - timedelta(days=90)).isoformat()
     with _database() as connection:
         rows = connection.execute(
@@ -124,25 +147,72 @@ def estimate(origin: str, destination: str, strategy: str, departure_at: datetim
         if gap <= 90:
             eligible.append((observed_at[:10], json.loads(routes_json)))
     distinct_days = sorted({day for day, _ in eligible})
-    if len(distinct_days) < 3:
-        return {"enough_data": False, "sample_days": len(distinct_days), "needed_days": 3}
-
-    grouped: dict[int, list[dict]] = {}
-    for _, routes in eligible:
+    grouped: dict[str, dict[str, list[dict]]] = {}
+    unmatched_routes = 0
+    for day, routes in eligible:
         for route in routes:
-            grouped.setdefault(int(route["index"]), []).append(route)
+            route_id = route.get("route_id")
+            if not route_id:
+                unmatched_routes += 1
+                continue
+            grouped.setdefault(str(route_id), {}).setdefault(day, []).append(route)
+
+    route_days = [
+        {"route_id": route_id, "sample_days": len(days)}
+        for route_id, days in grouped.items()
+    ]
+    route_days.sort(key=lambda item: (-item["sample_days"], item["route_id"]))
+    qualifying = {
+        route_id: days for route_id, days in grouped.items()
+        if len(days) >= MIN_ROUTE_DAYS
+    }
+    if not qualifying:
+        return {
+            "enough_data": False,
+            "sample_days": len(distinct_days),
+            "needed_days": MIN_ROUTE_DAYS,
+            "route_days": route_days,
+            "unmatched_routes": unmatched_routes,
+        }
+
     summaries = []
-    for index, samples in sorted(grouped.items()):
-        summary = {"index": index, "sample_count": len(samples)}
+    for route_id, days in sorted(qualifying.items()):
+        samples = [sample for day_samples in days.values() for sample in day_samples]
+        daily_values: dict[str, dict[str, list[float]]] = {}
         for field in ("duration_minutes", "distance_km", "tolls_yuan"):
-            values = [sample[field] for sample in samples if sample.get(field) is not None]
-            summary[field] = median(values) if values else None
+            daily_values[field] = {
+                day: [float(sample[field]) for sample in day_samples if sample.get(field) is not None]
+                for day, day_samples in days.items()
+            }
+        summary = {
+            "route_id": route_id,
+            "route_label": route_id[-8:],
+            "sample_count": len(samples),
+            "sample_days": len(days),
+        }
+        for field in ("duration_minutes", "distance_km", "tolls_yuan"):
+            day_medians = [median(values) for values in daily_values[field].values() if values]
+            summary[field] = median(day_medians) if day_medians else None
+        congestion_labels = ("畅通", "缓行", "拥堵", "严重拥堵", "未知")
+        daily_congestion = {
+            label: [
+                median([sample.get("congestion", {}).get(label, 0) for sample in day_samples])
+                for day_samples in days.values()
+            ]
+            for label in congestion_labels
+        }
         summary["congestion"] = {
-            label: round(median([sample["congestion"].get(label, 0) for sample in samples]))
-            for label in ("畅通", "缓行", "拥堵", "严重拥堵", "未知")
+            label: round(median(values))
+            for label, values in daily_congestion.items()
         }
         summary["slow_roads"] = list(dict.fromkeys(
             road for sample in samples for road in sample.get("slow_roads", [])
         ))[:8]
         summaries.append(summary)
-    return {"enough_data": bool(summaries), "sample_days": len(distinct_days), "routes": summaries}
+    return {
+        "enough_data": bool(summaries),
+        "sample_days": len(distinct_days),
+        "routes": summaries,
+        "route_days": route_days,
+        "unmatched_routes": unmatched_routes,
+    }
